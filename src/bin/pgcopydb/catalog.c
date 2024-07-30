@@ -148,8 +148,7 @@ static char *sourceDBcreateDDLs[] = {
 	"  id integer primary key,"
 	"  label text,"
 	"  start_time_epoch integer, done_time_epoch integer, duration integer, "
-	"  duration_pretty, "
-	"  count integer, bytes integer, bytes_pretty text"
+	"  count integer, bytes integer"
 	")",
 
 	"create table summary("
