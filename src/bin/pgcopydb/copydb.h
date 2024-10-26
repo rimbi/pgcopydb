@@ -232,6 +232,7 @@ typedef struct CopyDataSpec
 	bool skipDBproperties;
 	bool skipCtidSplit;
 	bool noRolesPasswords;
+	bool useCopyBinary;
 
 	bool restart;
 	bool resume;
@@ -288,8 +289,6 @@ bool copydb_prepare_filepaths(CopyFilePaths *cfPaths,
 							  const char *topdir,
 							  const char *serviceName);
 
-bool copydb_inspect_workdir(CopyFilePaths *cfPaths);
-
 bool copydb_rmdir_or_mkdir(const char *dir, bool removeDir);
 bool copydb_prepare_dump_paths(CopyFilePaths *cfPaths, DumpPaths *dumpPaths);
 
@@ -343,6 +342,11 @@ bool copydb_copy_extensions(CopyDataSpec *copySpecs, bool createExtensions);
 
 bool copydb_parse_extensions_requirements(CopyDataSpec *copySpecs,
 										  char *filename);
+bool copydb_prepare_extensions_restore(CopyDataSpec *copySpecs);
+bool copydb_finalize_extensions_restore(CopyDataSpec *copySpecs);
+
+bool timescaledb_pre_restore(CopyDataSpec *copySpecs, SourceExtension *ext);
+bool timescaledb_post_restore(CopyDataSpec *copySpecs, SourceExtension *ext);
 
 /* indexes.c */
 bool copydb_start_index_supervisor(CopyDataSpec *specs);
@@ -432,10 +436,6 @@ bool copydb_add_copy(CopyDataSpec *specs, uint32_t oid, uint32_t part);
 bool copydb_copy_data_by_oid(CopyDataSpec *specs, PGSQL *src,
 							 PGSQL *dst, uint32_t oid, uint32_t part);
 
-bool copydb_process_table_data_worker(CopyDataSpec *specs);
-
-bool copydb_process_table_data_with_workers(CopyDataSpec *specs);
-
 bool copydb_copy_table(CopyDataSpec *specs, PGSQL *src, PGSQL *dst,
 					   CopyTableDataSpec *tableSpecs,
 					   void *onCopyProgressContext,
@@ -472,7 +472,6 @@ bool copydb_blob_supervisor(CopyDataSpec *specs);
 bool copydb_start_blob_workers(CopyDataSpec *specs);
 bool copydb_blob_worker(CopyDataSpec *specs);
 bool copydb_queue_largeobject_metadata(CopyDataSpec *specs, uint64_t *count);
-bool copydb_copy_blob_by_oid(CopyDataSpec *specs, uint32_t oid);
 bool copydb_add_blob(CopyDataSpec *specs, uint32_t oid);
 bool copydb_send_lo_stop(CopyDataSpec *specs);
 
@@ -516,8 +515,6 @@ bool sentinel_sync_apply(DatabaseCatalog *catalog,
 bool print_summary(CopyDataSpec *specs);
 bool summary_prepare_toplevel_durations(CopyDataSpec *specs);
 bool prepare_summary_table(Summary *summary, CopyDataSpec *specs);
-
-bool summary_oid_done_fetch(SQLiteQuery *query);
 
 /*
  * Summary Table
@@ -611,14 +608,10 @@ bool compare_queue_tables(CopyDataSpec *copySpecs, Queue *queue);
 bool compare_data_worker(CopyDataSpec *copySpecs, Queue *queue);
 bool compare_data_by_table_oid(CopyDataSpec *copySpecs, uint32_t oid);
 
-bool compare_read_tables_sums(CopyDataSpec *copySpecs);
 bool compare_table(CopyDataSpec *copySpecs, SourceTable *source);
 
 bool compare_fetch_schemas(CopyDataSpec *copySpecs,
 						   CopyDataSpec *sourceSpecs,
 						   CopyDataSpec *targetSpecs);
-
-bool compare_write_checksum(SourceTable *table, const char *filename);
-bool compare_read_checksum(SourceTable *table, const char *filename);
 
 #endif  /* COPYDB_H */

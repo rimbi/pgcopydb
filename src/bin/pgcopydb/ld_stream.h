@@ -116,6 +116,7 @@ typedef struct LogicalMessageValues
 	LogicalMessageValue *array; /* malloc'ed area */
 } LogicalMessageValues;
 
+
 typedef struct LogicalMessageValuesArray
 {
 	int count;
@@ -123,10 +124,22 @@ typedef struct LogicalMessageValuesArray
 	LogicalMessageValues *array; /* malloc'ed area */
 } LogicalMessageValuesArray;
 
+typedef struct LogicalMessageAttribute
+{
+	char *attname; /* malloc'ed area */
+
+	bool isgenerated;
+} LogicalMessageAttribute;
+
+typedef struct LogicalMessageAttributeArray
+{
+	int count;
+	LogicalMessageAttribute *array; /* malloc'ed area */
+} LogicalMessageAttributeArray;
+
 typedef struct LogicalMessageTuple
 {
-	int cols;
-	char **columns;                  /* malloc'ed area */
+	LogicalMessageAttributeArray attributes;
 	LogicalMessageValuesArray values;
 } LogicalMessageTuple;
 
@@ -276,6 +289,49 @@ typedef enum
 
 
 /*
+ * Lookup key for the hash table GeneratedColumnsCache.
+ */
+typedef struct GeneratedColumnsCache_Lookup
+{
+	/* The table which has generated columns */
+	char nspname[PG_NAMEDATALEN];
+	char relname[PG_NAMEDATALEN];
+} GeneratedColumnsCache_Lookup;
+
+
+typedef struct GeneratedColumnSet
+{
+	char attname[PG_NAMEDATALEN];
+
+	UT_hash_handle hh;           /* makes this structure hashable */
+} GeneratedColumnSet;
+
+
+/*
+ * This is a multi-level hash table. The first level is the table
+ * (nspname.relname) with generated columns. The second level is the
+ * column name (attname).
+ *
+ * This design quickly eliminates tables without generated columns and
+ * finds generated column names efficiently.
+ *
+ * Another option is a single hash table with a composite key of
+ * nspname.relname.attname, but it requires a lookup for each column
+ * while processing.
+ */
+typedef struct GeneratedColumnsCache
+{
+	char nspname[PG_NAMEDATALEN];
+	char relname[PG_NAMEDATALEN];
+
+	/* set of generated columns implemented as a hash table */
+	GeneratedColumnSet *columns;
+
+	UT_hash_handle hh;           /* makes this structure hashable */
+} GeneratedColumnsCache;
+
+
+/*
  * StreamContext allows tracking the progress of the ld_stream module and is
  * shared also with the ld_transform module, which has its own instance of a
  * StreamContext to track its own progress.
@@ -308,6 +364,9 @@ typedef struct StreamContext
 
 	/* transform needs some catalog lookups (pkey, type oid) */
 	DatabaseCatalog *sourceDB;
+
+	/* hash table acts as a cache for tables with generated columns */
+	GeneratedColumnsCache *generatedColumnsCache;
 
 	Queue *transformQueue;
 	PGSQL *transformPGSQL;
@@ -514,8 +573,6 @@ bool streamFeedback(LogicalStreamContext *context);
 bool streamRotateFile(LogicalStreamContext *context);
 bool streamCloseFile(LogicalStreamContext *context, bool time_to_abort);
 
-bool streamWaitForSubprocess(LogicalStreamContext *context);
-
 bool prepareMessageMetadataFromContext(LogicalStreamContext *context);
 bool prepareMessageJSONbuffer(LogicalStreamContext *context);
 
@@ -561,9 +618,7 @@ bool stream_fetch_current_lsn(uint64_t *lsn,
 
 bool stream_write_context(StreamSpecs *specs, LogicalStreamClient *stream);
 bool stream_cleanup_context(StreamSpecs *specs);
-bool stream_read_context(CDCPaths *paths,
-						 IdentifySystem *system,
-						 uint32_t *WalSegSz);
+bool stream_read_context(StreamSpecs *specs);
 
 StreamAction StreamActionFromChar(char action);
 char * StreamActionToString(StreamAction action);
@@ -581,7 +636,7 @@ bool stream_compute_pathnames(uint32_t WalSegSz,
 							  char *walFileName,
 							  char *sqlFileName);
 
-bool stream_transform_context_init_pgsql(StreamSpecs *specs);
+bool stream_transform_context_init(StreamSpecs *specs);
 bool stream_transform_stream(StreamSpecs *specs);
 bool stream_transform_resume(StreamSpecs *specs);
 bool stream_transform_line(void *ctx, const char *line, bool *stop);
@@ -615,7 +670,6 @@ bool stream_write_insert(FILE *out, LogicalMessageInsert *insert);
 bool stream_write_truncate(FILE *out, LogicalMessageTruncate *truncate);
 bool stream_write_update(FILE *out, LogicalMessageUpdate *update);
 bool stream_write_delete(FILE * out, LogicalMessageDelete *delete);
-bool stream_write_sql_escape_string_constant(FILE *out, const char *str);
 
 bool stream_add_value_in_json_array(LogicalMessageValue *value,
 									JSON_Array *jsArray);
@@ -672,7 +726,7 @@ bool stream_apply_init_context(StreamApplyContext *context,
 							   char *origin,
 							   uint64_t endpos);
 
-bool setupReplicationOrigin(StreamApplyContext *context, bool logSQL);
+bool setupReplicationOrigin(StreamApplyContext *context);
 
 bool computeSQLFileName(StreamApplyContext *context);
 
@@ -683,7 +737,6 @@ bool stream_apply_find_durable_lsn(StreamApplyContext *context,
 
 
 /* ld_replay */
-bool stream_replay(StreamSpecs *specs);
 bool stream_apply_replay(StreamSpecs *specs);
 bool stream_replay_line(void *ctx, const char *line, bool *stop);
 bool stream_replay_reached_endpos(StreamSpecs *specs,

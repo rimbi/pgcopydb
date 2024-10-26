@@ -368,10 +368,6 @@ copydb_prepare_filepaths(CopyFilePaths *cfPaths,
 			"%s/slot",
 			cfPaths->cdc.dir);
 
-	sformat(cfPaths->cdc.tlihistfile, MAXPGPATH,
-			"%s/tli.history",
-			cfPaths->cdc.dir);
-
 	sformat(cfPaths->cdc.tlifile, MAXPGPATH,
 			"%s/tli",
 			cfPaths->cdc.dir);
@@ -516,6 +512,7 @@ copydb_init_specs(CopyDataSpec *specs,
 		.skipCtidSplit = options->skipCtidSplit,
 		.noRolesPasswords = options->noRolesPasswords,
 		.failFast = options->failFast,
+		.useCopyBinary = options->useCopyBinary,
 
 		.restart = options->restart,
 		.resume = options->resume,

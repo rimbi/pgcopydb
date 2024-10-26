@@ -74,12 +74,17 @@ commit;
 --
 begin;
 
-insert into public.identifer_as_column default values;
+insert into "Foo"".Bar".":Identifer As ""Column"".$1:" ("time", "[column name]") values (1, 'foo');
 
-update public.identifer_as_column set "time" = 1 where "time" = 0;
+update "Foo"".Bar".":Identifer As ""Column"".$1:" set "time" = 2, "[column name]" = '[bar]' where "time" = 1;
 
-delete from public.identifer_as_column where "time" = 1;
+delete from "Foo"".Bar".":Identifer As ""Column"".$1:" where "time" = 2;
 
+insert into "Unicode""Test".U&"\0441\043B\043E\043D" (id, U&"!0441!043B!043E!043D" UESCAPE '!', U&"!043A!043E!043B!043E!043D!043A!0430" UESCAPE '!') values (1, 'open', 'foo');
+
+update "Unicode""Test".U&"\0441\043B\043E\043D" set id = 2, U&"!0441!043B!043E!043D" UESCAPE '!' = 'closed', U&"\043A\043E\043B\043E\043D\043A\0430" = '[bar]' where id = 1;
+
+delete from "Unicode""Test".U&"\0441\043B\043E\043D" where id = 2;
 commit;
 
 --
@@ -88,5 +93,66 @@ commit;
 begin;
 
 insert into t_bit_types (a,b) values (B'10'::bit(3), B'101');
+
+commit;
+
+--
+-- Test generated columns insert, update, and delete
+--
+begin;
+insert into generated_column_test(id, name, email) values
+(1, 'Tiger', 'tiger@wild.com'),
+(2, 'Elephant', 'elephant@wild.com'),
+(3, 'Cat', 'cat@home.net');
+commit;
+
+begin;
+update generated_column_test set name = 'Lion'
+where id = 1;
+update generated_column_test set email='lion@wild.com'
+where email = 'tiger@wild.com';
+commit;
+
+begin;
+update generated_column_test set name = 'Kitten', email='kitten@home.com'
+where id = 3;
+commit;
+
+begin;
+delete from generated_column_test where id = 2;
+commit;
+
+
+--
+-- See https://github.com/dimitri/pgcopydb/issues/710
+--
+begin;
+
+-- uncompressed external toast data
+insert into xpto (toasted_col1, toasted_col2)
+select string_agg(g.i::text, ''), string_agg((g.i*2)::text, '')
+from generate_series(1, 2000) g(i);
+
+-- compressed external toast data
+insert into xpto (toasted_col2)
+select repeat(string_agg(to_char(g.i, 'fm0000'), ''), 50)
+from generate_series(1, 500) g(i);
+
+-- update of existing column
+update xpto
+set toasted_col1 = (select string_agg(g.i::text, '')
+from generate_series(1, 2000) g(i))
+where id = 1;
+
+update xpto set rand1 = 123.456 where id = 1;
+
+-- test case where the only data is external toast data
+insert into xpto2 (toasted_col1, toasted_col2)
+select string_agg(g.i::text, ''), string_agg((g.i*2)::text, '')
+from generate_series(1, 2000) g(i);
+
+-- weird update clause where the data is unchanged
+-- we expect to skip the update of the row as the data is unchanged
+update xpto2 set toasted_col1 = toasted_col1, toasted_col2 = toasted_col2;
 
 commit;

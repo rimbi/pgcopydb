@@ -350,13 +350,6 @@ set_psql_from_pg_config(PostgresPaths *pgPaths)
 }
 
 
-typedef struct DumpExtensionNamespaceContext
-{
-	char **extNamespaces;
-	int *extNamespaceCount;
-} DumpExtensionNamespaceContext;
-
-
 /*
  * Call pg_dump and get the given pre-data and post-data sections of
  * the dump into the target file.
@@ -1157,22 +1150,43 @@ archive_iter_toc_init(ArchiveTOCIterator *iter)
 	 * An archive TOC entry has a fixed format that looks like the following:
 	 *
 	 * ahprintf(AH, "%d; %u %u %s %s %s %s\n", te->dumpId,
-	 *          te->catalogId.tableoid, te->catalogId.oid, te->desc,
-	 *          sanitized_schema, sanitized_name, sanitized_owner);
+	 * te->catalogId.tableoid, te->catalogId.oid, te->desc, sanitized_schema,
+	 * sanitized_name, sanitized_owner);
 	 *
-	 * The %s parts are PG_NAMEDATALEN. The overall line fits into BUFSIZE.
+	 * The %s parts are PG_NAMEDATALEN except for sanitized_name for functions.
+	 * Let's calculate the maximum line length we can expect for all objects
+	 * except for functions, and add some headroom for the sanitized function
+	 * names later.
 	 *
-	 * Numbers require up to 10 chars (digits) to be printed, and
-	 * PG_NAMEDATALEN is 64 characters, but we need to double that for quoting
-	 * rules. Add in the semi-colon. And the desc is less than 32 characters,
-	 * the longest known being "PUBLICATION TABLES IN SCHEMA" at 30. Let's make
-	 * it 64 for headroom:
+	 * Numbers require up to 10 chars (digits) to be printed, and PG_NAMEDATALEN
+	 * is 64 characters, but we need to double that for quoting rules. Add in
+	 * the semi-colon. And the desc is less than 32 characters, the longest
+	 * known being "PUBLICATION TABLES IN SCHEMA" at 30. Let's make it 64 for
+	 * headroom:
 	 *
 	 * 3 * (10 + 1) + 1 + 3 * (2 * 64) + 64 = 482 chars
 	 *
+	 * The sanitized name of a function contains the name of the function
+	 * followed by a list of parameters types in parantheses, which can be quite
+	 * long. Let's calculate the upper limit for the length of the parameter
+	 * list:
+	 *
+	 * max_function_args is a compile-time constant that is set to 100 by
+	 * default in Postgres. Although it can be changed at compile time, we don't
+	 * want to care about that here.
+	 *
+	 * A type name can be up to PG_NAMEDATALEN characters long, and assuming we
+	 * have BUFSIZE is 1024 bytes.
+	 *
+	 * 100 * (PG_NAMEDATALEN + 2) = 100 * (64 + 2) = 100 * 66 = 6600 chars
+	 *
+	 * 6600 + 482 = 7082 chars
+	 *
 	 * BUFSIZE is 1024 bytes.
+	 *
+	 * 8 kilobytes is a reasonable size for a buffer.
 	 */
-	iter->fileIterator->bufsize = BUFSIZE;
+	iter->fileIterator->bufsize = BUFSIZE * 8;
 
 	if (!file_iter_lines_init(iter->fileIterator))
 	{
@@ -1382,84 +1396,6 @@ struct ArchiveItemDescMapping pgRestoreDescriptionArray[] = {
 	INSERT_MAPPING(ARCHIVE_TAG_VIEW, "VIEW"),
 	{ ARCHIVE_TAG_UNKNOWN, 0, "" }
 };
-
-
-/*
- * parse_archive_list implementation follows, see above for details/comments.
- */
-bool
-parse_archive_list(const char *filename, ArchiveContentArray *contents)
-{
-	char *buffer = NULL;
-	long fileSize = 0L;
-
-	if (!read_file(filename, &buffer, &fileSize))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	LinesBuffer lbuf = { 0 };
-
-	if (!splitLines(&lbuf, buffer))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	/*
-	 * If the file contains zero lines, we're done already, Also malloc(zero)
-	 * leads to "corrupted size vs. prev_size" run-time errors.
-	 */
-	if (lbuf.count == 0)
-	{
-		return true;
-	}
-
-	contents->count = 0;
-	contents->array =
-		(ArchiveContentItem *) calloc(lbuf.count, sizeof(ArchiveContentItem));
-
-	for (uint64_t lineNumber = 0; lineNumber < lbuf.count; lineNumber++)
-	{
-		ArchiveContentItem *item = &(contents->array[contents->count]);
-
-		char *line = lbuf.lines[lineNumber];
-
-		/* skip empty lines and lines that start with a semi-colon (comment) */
-		if (line == NULL || *line == '\0' || *line == ';')
-		{
-			continue;
-		}
-
-		if (!parse_archive_list_entry(item, line))
-		{
-			log_error("Failed to parse line %lld of \"%s\", "
-					  "see above for details",
-					  (long long) lineNumber,
-					  filename);
-			return false;
-		}
-
-		/* use same format as file input */
-		log_trace("parse_archive_list: %u; %u %u %s %s",
-				  item->dumpId,
-				  item->catalogOid,
-				  item->objectOid,
-				  item->description,
-				  item->restoreListName);
-
-		if (item->desc == ARCHIVE_TAG_UNKNOWN ||
-			IS_EMPTY_STRING_BUFFER(item->description))
-		{
-			log_warn("Failed to parse desc \"%s\"", line);
-		}
-
-		++contents->count;
-	}
-
-	return true;
-}
 
 
 /*
@@ -1676,14 +1612,8 @@ tokenize_archive_list_entry(ArchiveToken *token)
 		char *ptr = line;
 
 		/* advance ptr as long as *ptr is a digit */
-		for (; ptr != NULL && isdigit(*ptr); ptr++)
+		for (; isdigit(*ptr); ptr++)
 		{ }
-
-		if (ptr == NULL)
-		{
-			log_error("Failed to tokenize Archive Item line: %s", line);
-			return false;
-		}
 
 		int len = ptr - line + 1;
 		size_t size = len + 1;

@@ -26,6 +26,8 @@
 #include "log.h"
 #include "parsing_utils.h"
 #include "pgsql.h"
+#include "pgsql_timeline.h"
+#include "pgsql_utils.h"
 #include "pg_utils.h"
 #include "signals.h"
 #include "string_utils.h"
@@ -42,8 +44,6 @@ static void log_connection_error(PGconn *connection, int logLevel);
 static void pgAutoCtlDefaultNoticeProcessor(void *arg, const char *message);
 static bool pgsql_retry_open_connection(PGSQL *pgsql);
 
-static bool is_response_ok(PGresult *result);
-static bool clear_results(PGSQL *pgsql);
 static void pgsql_handle_notifications(PGSQL *pgsql);
 
 static void pgsql_execute_log_error(PGSQL *pgsql,
@@ -84,8 +84,6 @@ static bool flushAndSendFeedback(LogicalStreamClient *client,
 static void prepareToTerminate(LogicalStreamClient *client,
 							   bool keepalive,
 							   XLogRecPtr lsn);
-
-static void parseReplicationSlot(void *ctx, PGresult *result);
 
 
 /*
@@ -882,28 +880,6 @@ pgAutoCtlDefaultNoticeProcessor(void *arg, const char *message)
 
 
 /*
- * pgAutoCtlDebugNoticeProcessor is our PostgreSQL libpq Notice Processing to
- * use when wanting to send NOTICE, WARNING, HINT as log_sql messages.
- */
-void
-pgAutoCtlDebugNoticeProcessor(void *arg, const char *message)
-{
-	LinesBuffer lbuf = { 0 };
-
-	if (!splitLines(&lbuf, (char *) message))
-	{
-		/* errors have already been logged */
-		return;
-	}
-
-	for (uint64_t lineNumber = 0; lineNumber < lbuf.count; lineNumber++)
-	{
-		log_sql("%s", lbuf.lines[lineNumber]);
-	}
-}
-
-
-/*
  * pgsql_begin is responsible for opening a mutli statement connection and
  * opening a transaction block by issuing a 'BEGIN' query.
  */
@@ -1003,103 +979,6 @@ pgsql_commit(PGSQL *pgsql)
 	}
 
 	return result;
-}
-
-
-/*
- * pgsql_savepoint issues a SAVEPOINT command in the previously established
- * connection.
- */
-bool
-pgsql_savepoint(PGSQL *pgsql, char *name)
-{
-	if (pgsql->connectionStatementType != PGSQL_CONNECTION_MULTI_STATEMENT ||
-		pgsql->connection == NULL)
-	{
-		log_error("BUG: call to pgsql_savepoint() without holding an open "
-				  "multi statement connection");
-		if (pgsql->connection)
-		{
-			pgsql_finish(pgsql);
-		}
-		return false;
-	}
-
-	char sql[BUFSIZE] = { 0 };
-
-	sformat(sql, sizeof(sql), "savepoint %s", name);
-
-	if (!pgsql_execute(pgsql, sql))
-	{
-		pgsql_finish(pgsql);
-		return false;
-	}
-
-	return true;
-}
-
-
-/*
- * pgsql_rollback_to_savepoint issues the command ROLLBACK TO SAVEPOINT.
- */
-bool
-pgsql_rollback_to_savepoint(PGSQL *pgsql, char *name)
-{
-	if (pgsql->connectionStatementType != PGSQL_CONNECTION_MULTI_STATEMENT ||
-		pgsql->connection == NULL)
-	{
-		log_error("BUG: call to pgsql_rollback_to_savepoint() "
-				  "without holding an open multi statement connection");
-		if (pgsql->connection)
-		{
-			pgsql_finish(pgsql);
-		}
-		return false;
-	}
-
-	char sql[BUFSIZE] = { 0 };
-
-	sformat(sql, sizeof(sql), "rollback to savepoint %s", name);
-
-	if (!pgsql_execute(pgsql, sql))
-	{
-		pgsql_finish(pgsql);
-		return false;
-	}
-
-	return true;
-}
-
-
-/*
- * pgsql_release_savepoint issues the command RELEASE SAVEPOINT.
- */
-bool
-pgsql_release_savepoint(PGSQL *pgsql, char *name)
-{
-	if (pgsql->connectionStatementType != PGSQL_CONNECTION_MULTI_STATEMENT ||
-		pgsql->connection == NULL)
-	{
-		log_error("BUG: call to pgsql_release_savepoint() without holding an open "
-				  "multi statement connection");
-		if (pgsql->connection)
-		{
-			pgsql_finish(pgsql);
-		}
-		return false;
-	}
-
-	char sql[BUFSIZE] = { 0 };
-
-	sformat(sql, sizeof(sql), "release savepoint %s", name);
-
-	if (!pgsql_execute(pgsql, sql))
-	{
-		pgsql_finish(pgsql);
-		return false;
-	}
-
-	return true;
 }
 
 
@@ -2010,21 +1889,31 @@ pgsql_sync_pipeline(PGSQL *pgsql)
 		return false;
 	}
 
-	bool syncReceived = false;
+	int sock = PQsocket(conn);
 
-	int results = 0;
-
-	if (PQconsumeInput(conn) == 0)
+	if (sock < 0)
 	{
-		(void) pgsql_stream_log_error(
-			pgsql,
-			NULL,
-			"Failed to consume input for pipeline sync");
+		(void) pgcopy_log_error(pgsql, NULL, "Failed to get socket for pipeline sync");
 		return false;
 	}
 
-	(void) pgsql_handle_notifications(pgsql);
+	bool syncReceived = false;
 
+	/*
+	 * PQpipelineSync() might clear the select read readiness, so we need to
+	 * consume the input on the first iteration.
+	 *
+	 * The next iterations will consume input only when select() returns read
+	 * readiness.
+	 */
+	bool readyToConsume = true;
+
+	int results = 0;
+
+	/*
+	 * This implementation is based on the following libpq pipeline test,
+	 * https://github.com/postgres/postgres/blob/a68159ff2b32f290b1136e2940470d50b8491301/src/test/modules/libpq_pipeline/libpq_pipeline.c#L1967-L2023
+	 */
 	while (!syncReceived)
 	{
 		if (asked_to_quit || asked_to_stop || asked_to_stop_fast)
@@ -2037,44 +1926,110 @@ pgsql_sync_pipeline(PGSQL *pgsql)
 			return false;
 		}
 
-		PGresult *res = PQgetResult(conn);
-
-		if (res == NULL)
+		/*
+		 * PQisBusy will not itself attempt to read data from the server;
+		 * therefore PQconsumeInput must be invoked first, or the busy state
+		 * will never end.
+		 * Reference: https://www.postgresql.org/docs/current/libpq-async.html
+		 */
+		if (readyToConsume || PQisBusy(conn) == 1)
 		{
+			if (PQconsumeInput(conn) == 0)
+			{
+				(void) pgsql_stream_log_error(pgsql, NULL, "Failed to consume input");
+				return false;
+			}
+
 			/*
-			 * NULL represents a end of result for a single query, but we are
-			 * in pipeline mode and we can have multiple results.
-			 *
-			 * We need to continue consuming until we get a SYNC message.
+			 * On pipeline mode, we are not worried about the order of
+			 * the notifications, we just want to consume them to avoid
+			 * filling the notification buffer.
 			 */
+			(void) pgsql_handle_notifications(pgsql);
+		}
+
+		/*
+		 * Read results when the command is not busy.
+		 */
+		while (PQisBusy(conn) == 0)
+		{
+			PGresult *res = PQgetResult(conn);
+
+			if (res == NULL)
+			{
+				/*
+				 * NULL represents a end of result for a single query, but we are
+				 * in pipeline mode and we can have multiple results.
+				 *
+				 * We need to continue consuming until we get a SYNC message.
+				 */
+
+				continue;
+			}
+
+			results++;
+
+			ExecStatusType resultStatus = PQresultStatus(res);
+
+			if (resultStatus == PGRES_PIPELINE_SYNC)
+			{
+				syncReceived = true;
+
+				log_trace("Received pipeline sync. Total results: %d", results);
+
+				PQclear(res);
+
+				break;
+			}
+
+			if (!is_response_ok(res))
+			{
+				(void) pgcopy_log_error(pgsql, res, "Failed to receive pipeline sync");
+				PQclear(res);
+
+				return false;
+			}
+
+			PQclear(res);
+		}
+
+		/*
+		 * We need to wait for the socket to be ready for reading, otherwise
+		 * select() will return immediately and we will busy loop.
+		 */
+		fd_set input_mask;
+		struct timeval timeout;
+		struct timeval *timeoutptr = NULL;
+
+		/* sleep for 10ms to wait for input on the Postgres socket */
+		timeout.tv_sec = 0;
+		timeout.tv_usec = 10000;
+		timeoutptr = &timeout;
+
+		FD_ZERO(&input_mask);
+		FD_SET(sock, &input_mask);
+
+		int r = select(sock + 1, &input_mask, NULL, NULL, timeoutptr);
+
+		if (r == 0 || (r < 0 && errno == EINTR))
+		{
+			/* got a timeout or signal. The caller will get back later. */
+			readyToConsume = false;
 
 			continue;
 		}
-
-		results++;
-
-		ExecStatusType resultStatus = PQresultStatus(res);
-
-		if (resultStatus == PGRES_PIPELINE_SYNC)
+		else if (r < 0)
 		{
-			syncReceived = true;
+			(void) pgcopy_log_error(pgsql, NULL, "select failed: %m");
 
-			log_trace("Received pipeline sync. Total results: %d", results);
-
-			PQclear(res);
-
-			break;
-		}
-
-		if (!is_response_ok(res))
-		{
-			(void) pgcopy_log_error(pgsql, res, "Failed to receive pipeline sync");
-			PQclear(res);
+			clear_results(pgsql);
+			pgsql_finish(pgsql);
 
 			return false;
 		}
 
-		PQclear(res);
+		/* Else there is actually data on the socket */
+		readyToConsume = true;
 	}
 
 	/* update the last pipeline sync time */
@@ -2433,7 +2388,7 @@ build_parameters_list(PQExpBuffer buffer,
  * is_response_ok returns whether the query result is a correct response
  * (not an error or failure).
  */
-static bool
+bool
 is_response_ok(PGresult *result)
 {
 	ExecStatusType resultStatus = PQresultStatus(result);
@@ -2486,7 +2441,7 @@ pgsql_state_is_connection_error(PGSQL *pgsql)
  * clear_results consumes results on a connection until NULL is returned.
  * If an error is returned it returns false.
  */
-static bool
+bool
 clear_results(PGSQL *pgsql)
 {
 	PGconn *connection = pgsql->connection;
@@ -2726,7 +2681,10 @@ pg_copy_data(PGSQL *src, PGSQL *dst, CopyArgs *args, void *context, CopyProgress
 		}
 	}
 
-	/* cannot perform COPY FREEZE if the table was not created or truncated in the current subtransaction */
+	/*
+	 * COPY FREEZE is only accepted by Postgres if the table was created or
+	 * truncated in the current transaction.
+	 */
 	args->freeze &= args->truncate;
 
 	/* make sure to log TRUNCATE before we log COPY, avoid confusion */
@@ -3081,7 +3039,13 @@ pg_copy_send_query(PGSQL *pgsql, CopyArgs *args, ExecStatusType status)
 							  args->srcAttrList,
 							  args->srcQname);
 		}
+
 		appendPQExpBuffer(sql, "to stdout");
+
+		if (args->useCopyBinary)
+		{
+			appendPQExpBuffer(sql, " with (format binary)");
+		}
 	}
 	else if (status == PGRES_COPY_IN)
 	{
@@ -3096,9 +3060,17 @@ pg_copy_send_query(PGSQL *pgsql, CopyArgs *args, ExecStatusType status)
 			appendPQExpBuffer(sql, "copy %s from stdin", args->dstQname);
 		}
 
-		if (args->freeze)
+		if (args->freeze && args->useCopyBinary)
+		{
+			appendPQExpBuffer(sql, " with (freeze, format binary)");
+		}
+		else if (args->freeze)
 		{
 			appendPQExpBuffer(sql, " with (freeze)");
+		}
+		else if (args->useCopyBinary)
+		{
+			appendPQExpBuffer(sql, " with (format binary)");
 		}
 	}
 	else
@@ -3299,369 +3271,6 @@ getSequenceValue(void *ctx, PGresult *result)
 
 	/* if we reach this line, then we're good. */
 	context->parsedOk = true;
-}
-
-
-typedef struct IdentifySystemResult
-{
-	char sqlstate[6];
-	bool parsedOk;
-	IdentifySystem *system;
-} IdentifySystemResult;
-
-
-typedef struct TimelineHistoryResult
-{
-	char sqlstate[6];
-	bool parsedOk;
-	char filename[MAXPGPATH];
-	char content[BUFSIZE * BUFSIZE]; /* 1MB should get us quite very far */
-} TimelineHistoryResult;
-
-/*
- * pgsql_identify_system connects to the given pgsql client and issue the
- * replication command IDENTIFY_SYSTEM. The pgsql connection string should
- * contain the 'replication=1' parameter.
- */
-bool
-pgsql_identify_system(PGSQL *pgsql, IdentifySystem *system)
-{
-	bool connIsOurs = pgsql->connection == NULL;
-
-	PGconn *connection = pgsql_open_connection(pgsql);
-	if (connection == NULL)
-	{
-		/* error message was logged in pgsql_open_connection */
-		return false;
-	}
-
-	/* extended query protocol not supported in a replication connection */
-	PGresult *result = PQexec(connection, "IDENTIFY_SYSTEM");
-
-	if (!is_response_ok(result))
-	{
-		log_error("Failed to IDENTIFY_SYSTEM: %s", PQerrorMessage(connection));
-		PQclear(result);
-		clear_results(pgsql);
-
-		PQfinish(connection);
-
-		return false;
-	}
-
-	IdentifySystemResult isContext = { { 0 }, false, system };
-
-	(void) parseIdentifySystemResult((void *) &isContext, result);
-
-	PQclear(result);
-	clear_results(pgsql);
-
-	log_sql("IDENTIFY_SYSTEM: timeline %d, xlogpos %s, systemid %" PRIu64,
-			system->timeline,
-			system->xlogpos,
-			system->identifier);
-
-	if (!isContext.parsedOk)
-	{
-		log_error("Failed to get result from IDENTIFY_SYSTEM");
-		PQfinish(connection);
-		return false;
-	}
-
-	/* while at it, we also run the TIMELINE_HISTORY command */
-	if (system->timeline > 1)
-	{
-		TimelineHistoryResult hContext = { 0 };
-
-		char sql[BUFSIZE] = { 0 };
-		sformat(sql, sizeof(sql), "TIMELINE_HISTORY %d", system->timeline);
-
-		result = PQexec(connection, sql);
-
-		if (!is_response_ok(result))
-		{
-			log_error("Failed to request TIMELINE_HISTORY: %s",
-					  PQerrorMessage(connection));
-			PQclear(result);
-			clear_results(pgsql);
-
-			PQfinish(connection);
-
-			return false;
-		}
-
-		(void) parseTimelineHistoryResult((void *) &hContext, result);
-
-		PQclear(result);
-		clear_results(pgsql);
-
-		if (!hContext.parsedOk)
-		{
-			log_error("Failed to get result from TIMELINE_HISTORY");
-			PQfinish(connection);
-			return false;
-		}
-
-		if (!parseTimeLineHistory(hContext.filename, hContext.content, system))
-		{
-			/* errors have already been logged */
-			PQfinish(connection);
-			return false;
-		}
-
-		TimeLineHistoryEntry *current =
-			&(system->timelines.history[system->timelines.count - 1]);
-
-		log_sql("TIMELINE_HISTORY: \"%s\", timeline %d started at %X/%X",
-				hContext.filename,
-				current->tli,
-				(uint32_t) (current->begin >> 32),
-				(uint32_t) current->begin);
-	}
-
-	if (connIsOurs)
-	{
-		(void) pgsql_finish(pgsql);
-	}
-
-	return true;
-}
-
-
-/*
- * parsePgMetadata parses the result from a PostgreSQL query fetching
- * two columns from pg_stat_replication: sync_state and currentLSN.
- */
-static void
-parseIdentifySystemResult(void *ctx, PGresult *result)
-{
-	IdentifySystemResult *context = (IdentifySystemResult *) ctx;
-
-	if (PQnfields(result) != 4)
-	{
-		log_error("Query returned %d columns, expected 4", PQnfields(result));
-		context->parsedOk = false;
-		return;
-	}
-
-	if (PQntuples(result) == 0)
-	{
-		log_sql("parseIdentifySystem: query returned no rows");
-		context->parsedOk = false;
-		return;
-	}
-	if (PQntuples(result) != 1)
-	{
-		log_error("Query returned %d rows, expected 1", PQntuples(result));
-		context->parsedOk = false;
-		return;
-	}
-
-	/* systemid (text) */
-	char *value = PQgetvalue(result, 0, 0);
-	if (!stringToUInt64(value, &(context->system->identifier)))
-	{
-		log_error("Failed to parse system_identifier \"%s\"", value);
-		context->parsedOk = false;
-		return;
-	}
-
-	/* timeline (int4) */
-	value = PQgetvalue(result, 0, 1);
-	if (!stringToUInt32(value, &(context->system->timeline)))
-	{
-		log_error("Failed to parse timeline \"%s\"", value);
-		context->parsedOk = false;
-		return;
-	}
-
-	/* xlogpos (text) */
-	value = PQgetvalue(result, 0, 2);
-	strlcpy(context->system->xlogpos, value, PG_LSN_MAXLENGTH);
-
-	/* dbname (text) Database connected to or null */
-	if (!PQgetisnull(result, 0, 3))
-	{
-		value = PQgetvalue(result, 0, 3);
-		strlcpy(context->system->dbname, value, NAMEDATALEN);
-	}
-
-	context->parsedOk = true;
-}
-
-
-/*
- * parseTimelineHistory parses the result of the TIMELINE_HISTORY replication
- * command.
- */
-static void
-parseTimelineHistoryResult(void *ctx, PGresult *result)
-{
-	TimelineHistoryResult *context = (TimelineHistoryResult *) ctx;
-
-	if (PQnfields(result) != 2)
-	{
-		log_error("Query returned %d columns, expected 2", PQnfields(result));
-		context->parsedOk = false;
-		return;
-	}
-
-	if (PQntuples(result) == 0)
-	{
-		log_sql("parseTimelineHistory: query returned no rows");
-		context->parsedOk = false;
-		return;
-	}
-
-	if (PQntuples(result) != 1)
-	{
-		log_error("Query returned %d rows, expected 1", PQntuples(result));
-		context->parsedOk = false;
-		return;
-	}
-
-	/* filename (text) */
-	char *value = PQgetvalue(result, 0, 0);
-	strlcpy(context->filename, value, sizeof(context->filename));
-
-	/* content (bytea) */
-	value = PQgetvalue(result, 0, 1);
-
-	if (strlen(value) >= sizeof(context->content))
-	{
-		log_error("Received a timeline history file of %zu bytes, "
-				  "pgcopydb is limited to files of up to %zu bytes.",
-				  strlen(value),
-				  sizeof(context->content));
-		context->parsedOk = false;
-	}
-	strlcpy(context->content, value, sizeof(context->content));
-
-	context->parsedOk = true;
-}
-
-
-/*
- * parseTimeLineHistory parses the content of a timeline history file.
- */
-bool
-parseTimeLineHistory(const char *filename, const char *content,
-					 IdentifySystem *system)
-{
-	LinesBuffer lbuf = { 0 };
-
-	if (!splitLines(&lbuf, (char *) content))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	if (lbuf.count >= PGCOPYDB_MAX_TIMELINES)
-	{
-		log_error("history file \"%s\" contains %lld lines, "
-				  "pgcopydb only supports up to %d lines",
-				  filename, (long long) lbuf.count, PGCOPYDB_MAX_TIMELINES - 1);
-		return false;
-	}
-
-	/* keep the original content around */
-	strlcpy(system->timelines.filename, filename, MAXPGPATH);
-	strlcpy(system->timelines.content, content, PGCOPYDB_MAX_TIMELINE_CONTENT);
-
-	uint64_t prevend = InvalidXLogRecPtr;
-
-	system->timelines.count = 0;
-
-	TimeLineHistoryEntry *entry =
-		&(system->timelines.history[system->timelines.count]);
-
-	for (uint64_t lineNumber = 0; lineNumber < lbuf.count; lineNumber++)
-	{
-		char *ptr = lbuf.lines[lineNumber];
-
-		/* skip leading whitespace and check for # comment */
-		for (; *ptr; ptr++)
-		{
-			if (!isspace((unsigned char) *ptr))
-			{
-				break;
-			}
-		}
-
-		if (*ptr == '\0' || *ptr == '#')
-		{
-			continue;
-		}
-
-		log_trace("parseTimeLineHistory line %lld is \"%s\"",
-				  (long long) lineNumber,
-				  lbuf.lines[lineNumber]);
-
-		char *tabptr = strchr(lbuf.lines[lineNumber], '\t');
-
-		if (tabptr == NULL)
-		{
-			log_error("Failed to parse history file line %lld: \"%s\"",
-					  (long long) lineNumber, ptr);
-			return false;
-		}
-
-		*tabptr = '\0';
-
-		if (!stringToUInt(lbuf.lines[lineNumber], &(entry->tli)))
-		{
-			log_error("Failed to parse history timeline \"%s\"", tabptr);
-			return false;
-		}
-
-		char *lsn = tabptr + 1;
-
-		for (char *lsnend = lsn; *lsnend; lsnend++)
-		{
-			if (!(isxdigit((unsigned char) *lsnend) || *lsnend == '/'))
-			{
-				*lsnend = '\0';
-				break;
-			}
-		}
-
-		if (!parseLSN(lsn, &(entry->end)))
-		{
-			log_error("Failed to parse history timeline %d LSN \"%s\"",
-					  entry->tli, lsn);
-			return false;
-		}
-
-		entry->begin = prevend;
-		prevend = entry->end;
-
-		log_trace("parseTimeLineHistory[%d]: tli %d [%X/%X %X/%X]",
-				  system->timelines.count,
-				  entry->tli,
-				  LSN_FORMAT_ARGS(entry->begin),
-				  LSN_FORMAT_ARGS(entry->end));
-
-		entry = &(system->timelines.history[++system->timelines.count]);
-	}
-
-	/*
-	 * Create one more entry for the "tip" of the timeline, which has no entry
-	 * in the history file.
-	 */
-	entry->tli = system->timeline;
-	entry->begin = prevend;
-	entry->end = InvalidXLogRecPtr;
-
-	log_trace("parseTimeLineHistory[%d]: tli %d [%X/%X %X/%X]",
-			  system->timelines.count,
-			  entry->tli,
-			  LSN_FORMAT_ARGS(entry->begin),
-			  LSN_FORMAT_ARGS(entry->end));
-
-	/* fix the off-by-one so that the count is a count, not an index */
-	++system->timelines.count;
-
-	return true;
 }
 
 
@@ -4244,7 +3853,7 @@ pgsql_start_replication(LogicalStreamClient *client)
 	}
 
 	/* fetch the source timeline */
-	if (!pgsql_identify_system(pgsql, &(client->system)))
+	if (!pgsql_identify_system(pgsql, &(client->system), client->cdcPathDir))
 	{
 		/* errors have already been logged */
 		destroyPQExpBuffer(query);
@@ -5238,21 +4847,6 @@ pgsql_replication_origin_progress(PGSQL *pgsql,
 
 
 /*
- * pgsql_replication_slot_maintain advances the current confirmed position of
- * the given replication slot up to the given LSN position, create the
- * replication slot if it does not exist yet, and remove the slots that exist
- * in Postgres but are ommited in the given array of slots.
- */
-typedef struct ReplicationSlotContext
-{
-	char sqlstate[SQLSTATE_LENGTH];
-	char slotName[BUFSIZE];
-	char lsn[PG_LSN_MAXLENGTH];
-	bool parsedOK;
-} ReplicationSlotContext;
-
-
-/*
  * pgsql_replication_slot_exists checks that a replication slot with the given
  * slotName exists on the Postgres server.
  */
@@ -5327,63 +4921,6 @@ pgsql_replication_slot_exists(PGSQL *pgsql, const char *slotName,
 
 
 /*
- * pgsql_create_replication_slot tries to create a replication slot on the
- * database identified by a connection string. It's implemented as CREATE IF
- * NOT EXISTS so that it's idempotent and can be retried easily.
- */
-bool
-pgsql_create_replication_slot(PGSQL *pgsql,
-							  const char *slotName,
-							  StreamOutputPlugin plugin,
-							  uint64_t *lsn)
-{
-	ReplicationSlotContext context = { 0 };
-
-	char *sql =
-		pgsql->pgversion_num < 100000
-		?
-		"SELECT slot_name, xlog_position "
-		"  FROM pg_create_logical_replication_slot($1, $2)"
-		:
-		"SELECT slot_name, lsn "
-		"  FROM pg_create_logical_replication_slot($1, $2)";
-
-	char *pluginStr = OutputPluginToString(plugin);
-
-	int paramCount = 2;
-	const Oid paramTypes[2] = { TEXTOID, TEXTOID };
-	const char *paramValues[2] = { slotName, pluginStr };
-
-	log_sql("Creating logical replication slot \"%s\" with plugin \"%s\"",
-			slotName, pluginStr);
-
-	if (!pgsql_execute_with_params(pgsql, sql,
-								   paramCount, paramTypes, paramValues,
-								   &context, parseReplicationSlot))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	if (!context.parsedOK)
-	{
-		log_error("Failed to create the logical replication slot \"%s\" with "
-				  "plugin \"%s\"",
-				  slotName, pluginStr);
-		return false;
-	}
-
-	if (!parseLSN(context.lsn, lsn))
-	{
-		log_error("Failed to parse LSN \"%s\"", context.lsn);
-		return false;
-	}
-
-	return true;
-}
-
-
-/*
  * pgsql_drop_replication_slot drops a given replication slot.
  */
 bool
@@ -5401,42 +4938,6 @@ pgsql_drop_replication_slot(PGSQL *pgsql, const char *slotName)
 	return pgsql_execute_with_params(pgsql, sql,
 									 1, paramTypes, paramValues,
 									 NULL, NULL);
-}
-
-
-/*
- * parseReplicationSlotMaintain parses the result from a PostgreSQL query
- * fetching two columns from pg_stat_replication: sync_state and currentLSN.
- */
-static void
-parseReplicationSlot(void *ctx, PGresult *result)
-{
-	ReplicationSlotContext *context = (ReplicationSlotContext *) ctx;
-
-	if (PQnfields(result) != 2)
-	{
-		log_error("Query returned %d columns, expected 2", PQnfields(result));
-		context->parsedOK = false;
-		return;
-	}
-
-	if (PQntuples(result) != 1)
-	{
-		log_error("Query returned %d rows, expected 1", PQntuples(result));
-		context->parsedOK = false;
-		return;
-	}
-
-	char *value = PQgetvalue(result, 0, 0);
-	strlcpy(context->slotName, value, sizeof(context->slotName));
-
-	if (!PQgetisnull(result, 0, 1))
-	{
-		value = PQgetvalue(result, 0, 1);
-		strlcpy(context->lsn, value, sizeof(context->lsn));
-	}
-
-	context->parsedOK = true;
 }
 
 
@@ -5609,58 +5110,6 @@ pgsql_current_wal_flush_lsn(PGSQL *pgsql, uint64_t *lsn)
 		{
 			log_error("Failed to parse LSN \"%s\" returned from "
 					  "pg_current_wal_flush_lsn()",
-					  context.strVal);
-
-			return false;
-		}
-	}
-
-	return true;
-}
-
-
-/*
- * pgsql_current_wal_insert_lsn calls pg_current_wal_insert_lsn().
- */
-bool
-pgsql_current_wal_insert_lsn(PGSQL *pgsql, uint64_t *lsn)
-{
-	SingleValueResultContext context = { { 0 }, PGSQL_RESULT_STRING, false };
-
-	const char *sql = "select pg_current_wal_insert_lsn()";
-
-	/*
-	 * Postgres function pg_current_wal_insert_lsn() has had different names.
-	 */
-	if (pgsql->pgversion_num < 100000)
-	{
-		/* Postgres 9.5 and 9.6 had that function name */
-		sql = "select pg_current_xlog_insert_location()";
-	}
-	else if (pgsql->pgversion_num < 110000)
-	{
-		/* Postgres 10 had that function name (now returned pg_lsn) */
-		sql = "select pg_current_wal_insert_lsn()";
-	}
-
-	if (!pgsql_execute_with_params(pgsql, sql, 0, NULL, NULL,
-								   &context, &parseSingleValueResult))
-	{
-		log_error("Failed to call pg_current_wal_insert_lsn()");
-		return false;
-	}
-
-	if (context.isNull)
-	{
-		/* when we get a NULL, return 0/0 instead */
-		*lsn = InvalidXLogRecPtr;
-	}
-	else
-	{
-		if (!parseLSN(context.strVal, lsn))
-		{
-			log_error("Failed to parse LSN \"%s\" returned from "
-					  "pg_current_wal_insert_lsn()",
 					  context.strVal);
 
 			return false;

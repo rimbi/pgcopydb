@@ -54,14 +54,13 @@ SQLFILE=000000010000000000000002.sql
 expected=/tmp/expected.json
 result=/tmp/result.json
 
-JQSCRIPT='del(.lsn) | del(.nextlsn) | del(.timestamp) | del(.xid)'
+JQSCRIPT='del(.lsn) | del(.nextlsn) | del(.timestamp) | del(.xid) | if has("message") then .message |= sub("(?<m>COMMIT|BEGIN) [0-9]+"; "\(.m) XXX") else . end'
 
 jq "${JQSCRIPT}" /usr/src/pgcopydb/${WALFILE} > ${expected}
 jq "${JQSCRIPT}" ${SHAREDIR}/${WALFILE} > ${result}
 
 # first command to provide debug information, second to stop when returns non-zero
-diff ${expected} ${result} || cat ${SHAREDIR}/${WALFILE}
-diff ${expected} ${result}
+diff ${expected} ${result} || (cat ${SHAREDIR}/${WALFILE} && exit 1)
 
 # now prefetch the changes again, which should be a noop
 pgcopydb stream prefetch --resume --endpos "${lsn}" -vv
@@ -77,7 +76,7 @@ diff ${SHAREDIR}/${SQLFILE} /tmp/${SQLFILENAME}
 # we should also get the same result as expected (discarding LSN numbers)
 DIFFOPTS='-I BEGIN -I COMMIT -I KEEPALIVE -I SWITCH -I ENDPOS'
 
-diff ${DIFFOPTS} /usr/src/pgcopydb/${SQLFILE} ${SHAREDIR}/${SQLFILENAME}
+diff ${DIFFOPTS} /usr/src/pgcopydb/${SQLFILE} ${SHAREDIR}/${SQLFILENAME} || (cat ${SHAREDIR}/${SQLFILENAME} && exit 1)
 
 # now allow for replaying/catching-up changes
 pgcopydb stream sentinel set apply

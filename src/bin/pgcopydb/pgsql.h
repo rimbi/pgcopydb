@@ -264,9 +264,6 @@ void fetchedRows(void *ctx, PGresult *result);
 bool pgsql_begin(PGSQL *pgsql);
 bool pgsql_commit(PGSQL *pgsql);
 bool pgsql_rollback(PGSQL *pgsql);
-bool pgsql_savepoint(PGSQL *pgsql, char *name);
-bool pgsql_release_savepoint(PGSQL *pgsql, char *name);
-bool pgsql_rollback_to_savepoint(PGSQL *pgsql, char *name);
 
 bool pgsql_server_version(PGSQL *pgsql);
 
@@ -317,8 +314,6 @@ bool pgsql_prepare(PGSQL *pgsql, const char *name, const char *sql,
 bool pgsql_execute_prepared(PGSQL *pgsql, const char *name,
 							int paramCount, const char **paramValues,
 							void *context, ParsePostgresResultCB *parseFun);
-
-void pgAutoCtlDebugNoticeProcessor(void *arg, const char *message);
 
 bool validate_connection_string(const char *connectionString);
 
@@ -371,10 +366,10 @@ bool pg_copy_large_object(PGSQL *src,
 #define PG_LSN_MAXLENGTH 18
 
 /*
- * TimeLineHistoryEntry is taken from Postgres definitions and adapted to
+ * TimelineHistoryEntry is taken from Postgres definitions and adapted to
  * client-size code where we don't have all the necessary infrastruture. In
  * particular we don't define a XLogRecPtr data type nor do we define a
- * TimeLineID data type.
+ * TimelineID data type.
  *
  * Zero is used indicate an invalid pointer. Bootstrap skips the first possible
  * WAL segment, initializing the first WAL page at WAL segment size, so no XLOG
@@ -383,25 +378,13 @@ bool pg_copy_large_object(PGSQL *src,
 #define InvalidXLogRecPtr 0
 #define XLogRecPtrIsInvalid(r) ((r) == InvalidXLogRecPtr)
 
-#define PGCOPYDB_MAX_TIMELINES 1024
-#define PGCOPYDB_MAX_TIMELINE_CONTENT (1024 * 1024)
-
-typedef struct TimeLineHistoryEntry
+typedef struct TimelineHistoryEntry
 {
 	uint32_t tli;
 	uint64_t begin;         /* inclusive */
 	uint64_t end;           /* exclusive, InvalidXLogRecPtr means infinity */
-} TimeLineHistoryEntry;
+} TimelineHistoryEntry;
 
-
-typedef struct TimeLineHistory
-{
-	int count;
-	TimeLineHistoryEntry history[PGCOPYDB_MAX_TIMELINES];
-
-	char filename[MAXPGPATH];
-	char content[PGCOPYDB_MAX_TIMELINE_CONTENT];
-} TimeLineHistory;
 
 /*
  * The IdentifySystem contains information that is parsed from the
@@ -413,12 +396,10 @@ typedef struct IdentifySystem
 	uint32_t timeline;
 	char xlogpos[PG_LSN_MAXLENGTH];
 	char dbname[NAMEDATALEN];
-	TimeLineHistory timelines;
+	TimelineHistoryEntry currentTimeline;
+	char timelineHistoryFilename[MAXPGPATH];
 } IdentifySystem;
 
-bool pgsql_identify_system(PGSQL *pgsql, IdentifySystem *system);
-bool parseTimeLineHistory(const char *filename, const char *content,
-						  IdentifySystem *system);
 
 /*
  * Logical Decoding support.
@@ -474,6 +455,7 @@ typedef struct LogicalStreamClient
 {
 	PGSQL pgsql;
 	IdentifySystem system;
+	char cdcPathDir[MAXPGPATH];
 
 	char slotName[NAMEDATALEN];
 
@@ -559,11 +541,6 @@ bool pgsql_replication_slot_exists(PGSQL *pgsql,
 								   bool *slotExists,
 								   uint64_t *lsn);
 
-bool pgsql_create_replication_slot(PGSQL *pgsql,
-								   const char *slotName,
-								   StreamOutputPlugin plugin,
-								   uint64_t *lsn);
-
 bool pgsql_drop_replication_slot(PGSQL *pgsql, const char *slotName);
 
 bool pgsql_role_exists(PGSQL *pgsql, const char *roleName, bool *exists);
@@ -577,7 +554,6 @@ bool pgsql_table_exists(PGSQL *pgsql,
 						bool *exists);
 
 bool pgsql_current_wal_flush_lsn(PGSQL *pgsql, uint64_t *lsn);
-bool pgsql_current_wal_insert_lsn(PGSQL *pgsql, uint64_t *lsn);
 
 char * pgsql_escape_identifier(PGSQL *pgsql, char *src);
 #endif /* PGSQL_H */

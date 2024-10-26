@@ -975,7 +975,7 @@ cli_stream_transform(int argc, char **argv)
 			exit(EXIT_CODE_INTERNAL_ERROR);
 		}
 
-		if (!stream_transform_context_init_pgsql(&specs))
+		if (!stream_transform_context_init(&specs))
 		{
 			exit(EXIT_CODE_INTERNAL_ERROR);
 		}
@@ -1114,7 +1114,7 @@ cli_stream_apply(int argc, char **argv)
 		context.apply = true;
 		strlcpy(context.sqlFileName, sqlfilename, sizeof(context.sqlFileName));
 
-		if (!setupReplicationOrigin(&context, logSQL))
+		if (!setupReplicationOrigin(&context))
 		{
 			log_error("Failed to setup replication origin on the target database");
 			exit(EXIT_CODE_TARGET);

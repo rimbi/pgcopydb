@@ -97,6 +97,9 @@ static char *sourceDBcreateDDLs[] = {
 
 	"create index s_a_oid_attname on s_attr(oid, attname)",
 
+	/* index for filtering out generated columns */
+	"create index s_a_attisgenerated on s_attr(attisgenerated) where attisgenerated",
+
 	"create table s_table_part("
 	"  oid integer references s_table(oid), "
 	"  partnum integer, partcount integer, "
@@ -182,7 +185,10 @@ static char *sourceDBcreateDDLs[] = {
 	"create table sentinel("
 	"  id integer primary key check (id = 1), "
 	"  startpos pg_lsn, endpos pg_lsn, apply bool, "
-	" write_lsn pg_lsn, flush_lsn pg_lsn, replay_lsn pg_lsn)"
+	" write_lsn pg_lsn, flush_lsn pg_lsn, replay_lsn pg_lsn)",
+
+	"create table timeline_history("
+	"  tli integer primary key, startpos pg_lsn, endpos pg_lsn)"
 };
 
 
@@ -433,7 +439,8 @@ static char *sourceDBdropDDLs[] = {
 	"drop table if exists s_table_parts_done",
 	"drop table if exists s_table_indexes_done",
 
-	"drop table if exists sentinel"
+	"drop table if exists sentinel",
+	"drop table if exists timeline_history"
 };
 
 
@@ -1108,16 +1115,6 @@ bool
 catalog_commit(DatabaseCatalog *catalog)
 {
 	return catalog_execute(catalog, "COMMIT");
-}
-
-
-/*
- * catalog_rollback explicitely rollbacks a SQLite transaction.
- */
-bool
-catalog_rollback(DatabaseCatalog *catalog)
-{
-	return catalog_execute(catalog, "ROLLBACK");
 }
 
 
@@ -2770,57 +2767,6 @@ catalog_lookup_s_attr_by_name(DatabaseCatalog *catalog,
 
 
 /*
- * catalog_delete_s_table deletes an s_table entry for the given oid.
- */
-bool
-catalog_delete_s_table(DatabaseCatalog *catalog,
-					   const char *nspname,
-					   const char *relname)
-{
-	sqlite3 *db = catalog->db;
-
-	if (db == NULL)
-	{
-		log_error("BUG: Failed to initialize s_table iterator: db is NULL");
-		return false;
-	}
-
-	char *sql = "delete from s_table where nspname = $1 and relname = $2";
-
-	SQLiteQuery query = { 0 };
-
-	if (!catalog_sql_prepare(db, sql, &query))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	/* bind our parameters now */
-	BindParam params[] = {
-		{ BIND_PARAMETER_TYPE_TEXT, "nspname", 0, (char *) nspname },
-		{ BIND_PARAMETER_TYPE_TEXT, "relname", 0, (char *) relname }
-	};
-
-	int count = sizeof(params) / sizeof(params[0]);
-
-	if (!catalog_sql_bind(&query, params, count))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	/* now execute the query, which does not return any row */
-	if (!catalog_sql_execute_once(&query))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	return true;
-}
-
-
-/*
  * catalog_iter_s_table iterates over the list of tables in our catalogs.
  */
 bool
@@ -3685,73 +3631,6 @@ catalog_s_attr_fetch(SQLiteQuery *query)
 
 
 /*
- * catalog_s_table_fetch_attrs fetches the table SourceTableAttribute array
- * from our s_attr catalog.
- */
-bool
-catalog_s_table_count_attrs(DatabaseCatalog *catalog, SourceTable *table)
-{
-	sqlite3 *db = catalog->db;
-
-	if (db == NULL)
-	{
-		log_error("BUG: catalog_s_table_count_attrs: db is NULL");
-		return false;
-	}
-
-	char *sql = "select count(1) from s_attr where oid = $1";
-
-	SQLiteQuery query = {
-		.context = table,
-		.fetchFunction = &catalog_s_table_count_attrs_fetch
-	};
-
-	if (!catalog_sql_prepare(db, sql, &query))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	/* bind our parameters now */
-	BindParam params[1] = {
-		{ BIND_PARAMETER_TYPE_INT64, "oid", table->oid, NULL }
-	};
-
-	if (!catalog_sql_bind(&query, params, 1))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	/* now execute the query, which return exactly one row */
-	if (!catalog_sql_execute_once(&query))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	return true;
-}
-
-
-/*
- * catalog_s_table_count_attrs_fetch  is a SQLiteQuery callback.
- */
-bool
-catalog_s_table_count_attrs_fetch(SQLiteQuery *query)
-{
-	SourceTable *table = (SourceTable *) query->context;
-
-	int count = sqlite3_column_int(query->ppStmt, 0);
-
-	table->attributes.count = count;
-	table->attributes.array = NULL;
-
-	return true;
-}
-
-
-/*
  * catalog_add_s_index INSERTs a SourceIndex to our internal catalogs database.
  */
 bool
@@ -4536,65 +4415,6 @@ catalog_delete_s_index_all(DatabaseCatalog *catalog)
 	SQLiteQuery query = { 0 };
 
 	if (!catalog_sql_prepare(db, sql, &query))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	/* now execute the query, which does not return any row */
-	if (!catalog_sql_execute_once(&query))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	return true;
-}
-
-
-/*
- * catalog_delete_s_index_table DELETE all the indexes registered in the given
- * database catalog for the given table.
- */
-bool
-catalog_delete_s_index_table(DatabaseCatalog *catalog,
-							 const char *nspname,
-							 const char *relname)
-{
-	sqlite3 *db = catalog->db;
-
-	if (db == NULL)
-	{
-		log_error("BUG: Failed to initialize s_index iterator: db is NULL");
-		return false;
-	}
-
-	char *sql =
-		"delete from s_index "
-		" where tableoid = "
-		"       ("
-		"        select oid "
-		"          from s_table "
-		"         where nspname = $1 and relname = $2"
-		"        )";
-
-	SQLiteQuery query = { 0 };
-
-	if (!catalog_sql_prepare(db, sql, &query))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	/* bind our parameters now */
-	BindParam params[] = {
-		{ BIND_PARAMETER_TYPE_TEXT, "nspname", 0, (char *) nspname },
-		{ BIND_PARAMETER_TYPE_TEXT, "relname", 0, (char *) relname }
-	};
-
-	int count = sizeof(params) / sizeof(params[0]);
-
-	if (!catalog_sql_bind(&query, params, count))
 	{
 		/* errors have already been logged */
 		return false;
@@ -6373,6 +6193,101 @@ catalog_s_namespace_fetch(SQLiteQuery *query)
 
 
 /*
+ * catalog_extension_fetch fetches a SourceExtension entry from a SQLite
+ * ppStmt result set.
+ */
+bool
+catalog_extension_fetch(SQLiteQuery *query)
+{
+	SourceExtension *extension = (SourceExtension *) query->context;
+
+	/* cleanup the memory area before re-use */
+	bzero(extension, sizeof(SourceExtension));
+
+	extension->oid = sqlite3_column_int64(query->ppStmt, 0);
+
+	strlcpy(extension->extname,
+			(char *) sqlite3_column_text(query->ppStmt, 1),
+			sizeof(extension->extname));
+
+	strlcpy(extension->extnamespace,
+			(char *) sqlite3_column_text(query->ppStmt, 2),
+			sizeof(extension->extnamespace));
+
+	extension->extrelocatable = sqlite3_column_int(query->ppStmt, 3) == 1;
+
+	return true;
+}
+
+
+/*
+ * catalog_lookup_ext_namespace_by_extname fetches a s_extension entry from our
+ * catalogs.
+ */
+bool
+catalog_lookup_s_extension_by_extname(DatabaseCatalog *catalog,
+									  const char *extname,
+									  SourceExtension *result)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_lookup_s_extension_by_extname: db is NULL");
+		return false;
+	}
+
+	char *sql =
+		"  select oid, extname, extnamespace, extrelocatable "
+		"    from s_extension "
+		"   where extname = $1 ";
+
+	SQLiteQuery query = {
+		.context = result,
+		.fetchFunction = &catalog_extension_fetch
+	};
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[1] = {
+		{ BIND_PARAMETER_TYPE_TEXT, "extname", 0,
+		  (char *) extname },
+	};
+
+	if (!catalog_sql_bind(&query, params, 1))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which return exactly one row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
  * catalog_add_s_extension INSERTs a SourceExtension to our internal catalogs
  * database.
  */
@@ -7700,6 +7615,171 @@ catalog_count_summary_done_fetch(SQLiteQuery *query)
 
 
 /*
+ * catalog_add_timeline_history inserts a timeline history entry to our
+ * internal catalogs database.
+ */
+bool
+catalog_add_timeline_history(DatabaseCatalog *catalog, TimelineHistoryEntry *entry)
+{
+	if (catalog == NULL)
+	{
+		log_error("BUG: catalog_add_timeline_history: catalog is NULL");
+		return false;
+	}
+
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_add_timeline_history: db is NULL");
+		return false;
+	}
+
+	char *sql =
+		"insert or replace into timeline_history(tli, startpos, endpos)"
+		"values($1, $2, $3)";
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	char slsn[PG_LSN_MAXLENGTH] = { 0 };
+	char elsn[PG_LSN_MAXLENGTH] = { 0 };
+
+	sformat(slsn, sizeof(slsn), "%X/%X", LSN_FORMAT_ARGS(entry->begin));
+	sformat(elsn, sizeof(elsn), "%X/%X", LSN_FORMAT_ARGS(entry->end));
+
+	/* bind our parameters now */
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT, "tli", entry->tli, NULL },
+		{ BIND_PARAMETER_TYPE_TEXT, "startpos", 0, slsn },
+		{ BIND_PARAMETER_TYPE_TEXT, "endpos", 0, elsn }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/* now execute the query, which does not return any row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * catalog_lookup_timeline_history fetches the current TimelineHistoryEntry
+ * from our catalogs.
+ */
+bool
+catalog_lookup_timeline_history(DatabaseCatalog *catalog,
+								int tli,
+								TimelineHistoryEntry *entry)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_lookup_timeline_history: db is NULL");
+		return false;
+	}
+
+	SQLiteQuery query = {
+		.context = entry,
+		.fetchFunction = &catalog_timeline_history_fetch
+	};
+
+	char *sql =
+		"  select tli, startpos, endpos"
+		"    from timeline_history"
+		"   where tli = $1";
+
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT, "tli", tli, NULL }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/* now execute the query, which return exactly one row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * catalog_timeline_history_fetch fetches a TimelineHistoryEntry from a query
+ * ppStmt result.
+ */
+bool
+catalog_timeline_history_fetch(SQLiteQuery *query)
+{
+	TimelineHistoryEntry *entry = (TimelineHistoryEntry *) query->context;
+
+	bzero(entry, sizeof(TimelineHistoryEntry));
+
+	/* tli */
+	entry->tli = sqlite3_column_int(query->ppStmt, 0);
+
+	/* begin LSN */
+	if (sqlite3_column_type(query->ppStmt, 1) != SQLITE_NULL)
+	{
+		const char *startpos = (const char *) sqlite3_column_text(query->ppStmt, 1);
+
+		if (!parseLSN(startpos, &entry->begin))
+		{
+			log_error("Failed to parse LSN from \"%s\"", startpos);
+			return false;
+		}
+	}
+
+	/* end LSN */
+	if (sqlite3_column_type(query->ppStmt, 2) != SQLITE_NULL)
+	{
+		const char *endpos = (const char *) sqlite3_column_text(query->ppStmt, 2);
+
+		if (!parseLSN(endpos, &entry->end))
+		{
+			log_error("Failed to parse LSN from \"%s\"", endpos);
+			return false;
+		}
+	}
+
+	return true;
+}
+
+
+/*
  * catalog_execute executes sqlite query
  */
 bool
@@ -8148,4 +8228,119 @@ catalog_stop_timing(TopLevelTiming *timing)
 						 timing->ppDuration,
 						 INTSTRING_MAX_DIGITS);
 	}
+}
+
+
+/*
+ * catalog_iter_s_table_generated_columns iterates over the list of tables that
+ * have a generated columns in our catalogs.
+ */
+bool
+catalog_iter_s_table_generated_columns(DatabaseCatalog *catalog,
+									   void *context,
+									   SourceTableIterFun *callback)
+{
+	SourceTableIterator *iter =
+		(SourceTableIterator *) calloc(1, sizeof(SourceTableIterator));
+
+	iter->catalog = catalog;
+
+	if (!catalog_iter_s_table_generated_columns_init(iter))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	for (;;)
+	{
+		if (!catalog_iter_s_table_next(iter))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		SourceTable *table = iter->table;
+
+		if (table == NULL)
+		{
+			if (!catalog_iter_s_table_finish(iter))
+			{
+				/* errors have already been logged */
+				return false;
+			}
+
+			break;
+		}
+
+		/* now call the provided callback */
+		if (!(*callback)(context, table))
+		{
+			log_error("Failed to iterate over list of tables, "
+					  "see above for details");
+			return false;
+		}
+	}
+
+
+	return true;
+}
+
+
+/*
+ * catalog_iter_s_table_generated_columns_init initializes an Interator over our
+ * catalog of SourceTable entries which has generated columns.
+ */
+bool
+catalog_iter_s_table_generated_columns_init(SourceTableIterator *iter)
+{
+	sqlite3 *db = iter->catalog->db;
+
+	if (db == NULL)
+	{
+		log_error(
+			"BUG: Failed to initialize catalog_iter_s_table_generated_columns_init iterator: db is NULL");
+		return false;
+	}
+
+	iter->table = (SourceTable *) calloc(1, sizeof(SourceTable));
+
+	if (iter->table == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
+	char *sql =
+		"  select t.oid, qname, nspname, relname, amname, restore_list_name, "
+		"         relpages, reltuples, ts.bytes, ts.bytes_pretty, "
+		"         exclude_data, part_key, "
+		"         (select count(1) from s_table_part p where p.oid = t.oid) "
+		"    from s_table t join s_attr a "
+
+		/*
+		 * Currently, we handle only:
+		 * - Generated columns with is_generated = 'ALWAYS' for INSERT and UPDATE
+		 * - IDENTITY columns for INSERT using "overriding system value"
+		 *
+		 * TODO: Add support for IDENTITY columns in UPDATE.
+		 * https://github.com/dimitri/pgcopydb/issues/844
+		 */
+		"       on (a.oid = t.oid and a.attisgenerated = 1) "
+		"       left join s_table_size ts on ts.oid = t.oid "
+		"group by t.oid "
+		"  having sum(a.attisgenerated) > 0 "
+		"order by bytes desc";
+
+	SQLiteQuery *query = &(iter->query);
+
+	query->context = iter->table;
+	query->fetchFunction = &catalog_s_table_fetch;
+
+	if (!catalog_sql_prepare(db, sql, query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	return true;
 }
