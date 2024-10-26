@@ -7,6 +7,7 @@
 #include <getopt.h>
 #include <inttypes.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "catalog.h"
@@ -172,13 +173,10 @@ copydb_copy_ext_table(PGSQL *src, PGSQL *dst, char *qname, char *condition)
 		.srcAttrList = "*",
 		.srcWhereClause = condition,
 		.dstQname = qname,
-		.dstAttrList = ""
+		.dstAttrList = "",
 	};
 
-	/* skip statistics maintenance on extension configuration tables */
-	CopyStats stats = { 0 };
-
-	if (!pg_copy(src, dst, &args, &stats, NULL, NULL))
+	if (!pg_copy(src, dst, &args, NULL, NULL))
 	{
 		/* errors have already been logged */
 		return false;

@@ -331,21 +331,14 @@ typedef struct CopyArgs
 	char *logCommand;
 	bool truncate;
 	bool freeze;
-	bool useCopyBinary;
 } CopyArgs;
 
+/* Callback type to be called during the copy data operation */
+typedef bool (*CopyProgressCallback)(int bytesTransmitted, void *context);
 
-typedef struct CopyStats
-{
-	uint64_t startTime;
-	uint64_t bytesTransmitted;
-} CopyStats;
 
-typedef bool (CopyStatsCallback)(void *context, CopyStats *stats);
-
-bool pg_copy(PGSQL *src, PGSQL *dst,
-			 CopyArgs *args, CopyStats *stats,
-			 void *context, CopyStatsCallback *callback);
+bool pg_copy(PGSQL *src, PGSQL *dst, CopyArgs *args, void *context, CopyProgressCallback
+			 on_copy_progress_hook);
 
 bool pg_copy_from_stdin(PGSQL *pgsql, const char *qname);
 bool pg_copy_row_from_stdin(PGSQL *pgsql, char *fmt, ...);

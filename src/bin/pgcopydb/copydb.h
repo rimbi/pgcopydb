@@ -10,6 +10,7 @@
 #include "copydb_paths.h"
 #include "filtering.h"
 #include "lock_utils.h"
+#include "portability/instr_time.h"
 #include "queue_utils.h"
 #include "pgcmd.h"
 #include "pgsql.h"
@@ -436,7 +437,9 @@ bool copydb_copy_data_by_oid(CopyDataSpec *specs, PGSQL *src,
 							 PGSQL *dst, uint32_t oid, uint32_t part);
 
 bool copydb_copy_table(CopyDataSpec *specs, PGSQL *src, PGSQL *dst,
-					   CopyTableDataSpec *tableSpecs);
+					   CopyTableDataSpec *tableSpecs,
+					   void *onCopyProgressContext,
+					   CopyProgressCallback onCopyProgress);
 
 
 bool copydb_table_create_lockfile(CopyDataSpec *specs,
@@ -444,8 +447,10 @@ bool copydb_table_create_lockfile(CopyDataSpec *specs,
 								  PGSQL *dst,
 								  bool *isDone);
 
-bool copydb_mark_table_as_done(CopyDataSpec *specs,
-							   CopyTableDataSpec *tableSpecs);
+bool copydb_save_copy_progress(CopyDataSpec *specs,
+							   uint64_t count,
+							   uint64_t bytes,
+							   instr_time lastSavingTime);
 
 bool copydb_table_parts_are_all_done(CopyDataSpec *specs,
 									 CopyTableDataSpec *tableSpecs,
@@ -525,8 +530,8 @@ bool summary_add_table(DatabaseCatalog *catalog,
 bool summary_finish_table(DatabaseCatalog *catalog,
 						  CopyTableDataSpec *tableSpecs);
 
-bool summary_update_table_copy_stats(DatabaseCatalog *catalog,
-									 CopyTableDataSpec *tableSpecs);
+bool summary_update_table(DatabaseCatalog *catalog,
+						  CopyTableDataSpec *tableSpecs);
 
 bool summary_delete_table(DatabaseCatalog *catalog,
 						  CopyTableDataSpec *tableSpecs);
