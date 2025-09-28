@@ -202,69 +202,31 @@ cli_dump_schema_getopts(int argc, char **argv)
 			}
 
 			case 'V':
+			case 'h':
 			{
-				/* keeper_cli_print_version prints version and exits. */
-				cli_print_version(argc, argv);
-				break;
-			}
-
-			case 'v':
-			{
-				++verboseCount;
-				switch (verboseCount)
+				if (cli_handle_help_or_version(c, argc, argv))
 				{
-					case 1:
-					{
-						log_set_level(LOG_NOTICE);
-						break;
-					}
-
-					case 2:
-					{
-						log_set_level(LOG_SQL);
-						break;
-					}
-
-					case 3:
-					{
-						log_set_level(LOG_DEBUG);
-						break;
-					}
-
-					default:
-					{
-						log_set_level(LOG_TRACE);
-						break;
-					}
+					break;
 				}
 				break;
 			}
 
-			case 'd':
-			{
-				verboseCount = 3;
-				log_set_level(LOG_DEBUG);
-				break;
-			}
-
-			case 'z':
-			{
-				verboseCount = 4;
-				log_set_level(LOG_TRACE);
-				break;
-			}
-
-			case 'q':
-			{
-				log_set_level(LOG_ERROR);
-				break;
-			}
-
-			case 'h':
 			case '?':
 			{
 				commandline_help(stderr);
 				exit(EXIT_CODE_QUIT);
+				break;
+			}
+
+			case 'v':
+			case 'd':
+			case 'z':
+			case 'q':
+			{
+				if (cli_handle_logging_option(c, &verboseCount))
+				{
+					break;
+				}
 				break;
 			}
 		}

@@ -63,6 +63,15 @@ make tests
 make tests/pagila
 ```
 
+### Catalog abstractions for unit tests
+
+The catalog layer now exposes a dispatch table (`CatalogOps`) so tests can swap
+the default SQLite-backed storage. Production code resolves to
+`catalog_sqlite_ops`, while unit tests can inject a simulator with
+`catalog_register_ops(&my_fake_ops)` and restore the default afterwards with
+`catalog_register_ops(&catalog_sqlite_ops)`. This allows new unit tests under
+`tests/unit/` to exercise logic without spinning up Docker containers.
+
 ### Documentation
 
 User-facing documentation is published on

@@ -148,6 +148,108 @@ cli_pprint_json(JSON_Value *js)
 
 
 /*
+ * Common helpers to centralize duplicated option handling across commands.
+ */
+bool
+cli_handle_help_or_version(int c, int argc, char **argv)
+{
+	switch (c)
+	{
+		case 'h':
+		{
+			commandline_help(stderr);
+			exit(EXIT_CODE_QUIT);
+			return true; /* unreachable, but appease compiler */
+		}
+
+		case 'V':
+		{
+			cli_print_version(argc, argv); /* exits */
+			return true; /* unreachable, but appease compiler */
+		}
+
+		default:
+			return false;
+	}
+
+	/* not reached */
+	return false;
+}
+
+
+bool
+cli_handle_logging_option(int c, int *verboseCount)
+{
+	switch (c)
+	{
+		case 'v':
+		{
+			if (verboseCount)
+			{
+				++(*verboseCount);
+				switch (*verboseCount)
+				{
+					case 1:
+					{
+						log_set_level(LOG_NOTICE);
+						break;
+					}
+
+					case 2:
+					{
+						log_set_level(LOG_SQL);
+						break;
+					}
+
+					case 3:
+					{
+						log_set_level(LOG_DEBUG);
+						break;
+					}
+
+					default:
+					{
+						log_set_level(LOG_TRACE);
+						break;
+					}
+				}
+			}
+			return true;
+		}
+
+		case 'd':
+		{
+			if (verboseCount)
+			{
+				*verboseCount = 3;
+			}
+			log_set_level(LOG_DEBUG);
+			return true;
+		}
+
+		case 'z':
+		{
+			if (verboseCount)
+			{
+				*verboseCount = 4;
+			}
+			log_set_level(LOG_TRACE);
+			return true;
+		}
+
+		case 'q':
+		{
+			log_set_level(LOG_ERROR);
+			return true;
+		}
+
+		default:
+			return false;
+	}
+}
+
+
+/*
  * cli_copydb_getenv_source_pguri reads the PGCOPYDB_SOURCE_PGURI environment
  * variable and duplicates its value at the given place.
  */
