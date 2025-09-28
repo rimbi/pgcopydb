@@ -664,4 +664,14 @@ bool catalog_bind_parameters(sqlite3 *db,
 							 BindParam *params,
 							 int count);
 
+typedef struct CatalogOps
+{
+#include "catalog_ops_struct.inc"
+} CatalogOps;
+
+extern const CatalogOps catalog_sqlite_ops;
+
+void catalog_register_ops(const CatalogOps *ops);
+const CatalogOps * catalog_get_ops(void);
+
 #endif  /* CATALOG_H */

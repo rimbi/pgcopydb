@@ -129,4 +129,14 @@ bool cli_parse_bytes_pretty(const char *byteString,
 
 bool cli_prepare_pguris(ConnStrings *connStrings);
 
+/*
+ * Common CLI helpers to reduce option-handling duplication
+ */
+
+/* Returns true if handled (and possibly exited), false otherwise */
+bool cli_handle_help_or_version(int c, int argc, char **argv);
+
+/* Returns true if handled, false otherwise; updates verboseCount and log level */
+bool cli_handle_logging_option(int c, int *verboseCount);
+
 #endif  /* CLI_COMMON_H */
